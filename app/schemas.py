@@ -7,7 +7,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +160,170 @@ class ChainResponse(BaseModel):
     break_reason: BreakReason
     break_detail: str | None = None
     break_scan_ids: list[str] = Field(default_factory=list)
+    # Plan version and reconciliation read from the same committed snapshot.
+    plan_revision: int | None = None
+    reconciliation: "Reconciliation | None" = None
+
+
+# --------------------------------------------------------------------------- #
+# Handover plan (registered expectations) and reconciliation
+# --------------------------------------------------------------------------- #
+class PlanItemIn(BaseModel):
+    """One planned handover: receiver, inclusive UTC window, mandatory flag."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    receiver: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices(
+            "receiver", "expected_receiver", "custodian", "party"
+        ),
+        description="计划接收方，可重复出现",
+    )
+    window_start: datetime = Field(
+        validation_alias=AliasChoices(
+            "window_start", "start", "start_utc", "from_utc", "window_from"
+        ),
+        description="含首 UTC 时间窗起点",
+    )
+    window_end: datetime = Field(
+        validation_alias=AliasChoices(
+            "window_end", "end", "end_utc", "to_utc", "window_to"
+        ),
+        description="含尾 UTC 时间窗终点",
+    )
+    required: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("required", "mandatory", "is_required"),
+        description="是否必经项",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_window(cls, data: object) -> object:
+        """Accept ``{"receiver": ..., "window": {"start": ..., "end": ...}}``."""
+        if isinstance(data, dict) and isinstance(data.get("window"), dict):
+            win = data["window"]
+            data = {k: v for k, v in data.items() if k != "window"}
+            data.setdefault("window_start", win.get("start", win.get("from")))
+            data.setdefault("window_end", win.get("end", win.get("to")))
+        return data
+
+    @field_validator("receiver")
+    @classmethod
+    def _strip_receiver(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _require_tz(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("window bounds must carry an explicit timezone offset")
+        return v
+
+    @model_validator(mode="after")
+    def _ordered_window(self) -> "PlanItemIn":
+        if self.window_start > self.window_end:
+            raise ValueError("window_start must not be after window_end")
+        return self
+
+
+class PlanReplace(BaseModel):
+    """Full replacement of a waybill's registered handover plan."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    revision: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices("revision", "plan_revision", "version"),
+        description="计划版号；省略时自动取当前版号 + 1",
+    )
+    items: list[PlanItemIn] = Field(
+        min_length=1,
+        max_length=60,
+        validation_alias=AliasChoices("items", "plan", "entries", "steps"),
+    )
+
+
+class PlanItemView(BaseModel):
+    index: int
+    receiver: str
+    window_start: datetime
+    window_end: datetime
+    required: bool
+
+
+class PlanView(BaseModel):
+    waybill_id: str
+    revision: int | None
+    items: list[PlanItemView]
+
+
+class PlanReplaceResponse(BaseModel):
+    waybill_id: str
+    plan_revision: int | None
+    plan: PlanView | None
+    reconciliation: "Reconciliation"
+
+
+class MatchSummary(BaseModel):
+    """Aggregate of all legal correspondences (never enumerated: it can explode)."""
+
+    correspondence_count: int = 0
+    max_scans: int = 0
+
+
+class PlanItemStatus(BaseModel):
+    index: int
+    receiver: str
+    required: bool
+    status: Literal["CONFIRMED", "POSSIBLE", "UNSUPPORTED"]
+    supporting_scan_ids: list[str]
+
+
+class ScanStatus(BaseModel):
+    scan_id: str
+    revision: int
+    status: Literal["CONFIRMED", "POSSIBLE"]
+    plan_indices: list[int]
+
+
+class ScanResolution(BaseModel):
+    """Earliest scan revision whose prefix can no longer be matched."""
+
+    scan_id: str
+    revision: int
+    prefix_length: int
+    detail: str
+
+
+class Reconciliation(BaseModel):
+    waybill_id: str
+    plan_revision: int | None
+    has_plan: bool
+    scans_considered: int
+    match: MatchSummary
+    items: list[PlanItemStatus]
+    scans: list[ScanStatus]
+    unresolved: ScanResolution | None = None
+    chain_intact: bool
+    required_covered: bool
+    complete: bool
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def earliest_unmatched_scan_id(self) -> str | None:
+        """Earliest scan that makes the prefix unmatchable (None if matched)."""
+        return self.unresolved.scan_id if self.unresolved else None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def earliest_unmatched_revision(self) -> int | None:
+        return self.unresolved.revision if self.unresolved else None
 
 
 class BatchResponse(BaseModel):
@@ -159,7 +331,13 @@ class BatchResponse(BaseModel):
     applied: int
     idempotent_duplicates: int
     withdrawn_scan_ids: list[str]
+    # Plan version and reconciliation at the moment this submission committed.
+    plan_revision: int | None = None
+    reconciliation: Reconciliation | None = None
     chain: ChainResponse
+
+
+PlanReplaceResponse.model_rebuild()
 
 
 # --------------------------------------------------------------------------- #

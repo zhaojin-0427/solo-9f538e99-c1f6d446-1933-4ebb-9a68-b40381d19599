@@ -48,3 +48,20 @@ def handover(scan_id, revision, ts, giver, receiver):
 
 def withdrawal(scan_id, revision):
     return {"scan_id": scan_id, "revision": revision, "event_type": "WITHDRAWAL"}
+
+
+def plan_item(receiver, start, end, required=False):
+    return {
+        "receiver": receiver,
+        "window_start": start,
+        "window_end": end,
+        "required": required,
+    }
+
+
+def make_plan(client, wid="AWB-1", revision=1, items=None):
+    r = client.put(
+        f"/api/waybills/{wid}/plan",
+        json={"revision": revision, "items": items or []},
+    )
+    return r

@@ -87,4 +87,76 @@ st, body = call("POST", "/api/waybills/AWB-SMOKE/scans/batch", {"scans": [
 ]})
 check("naive timestamp -> 422", st == 422)
 
-print("ALL SMOKE CHECKS PASSED")
+# --- handover plan registration + reconciliation --------------------------- #
+# Remove the deliberately-ambiguous S4/S5 pair so the trusted prefix is clean:
+# S1 (08:00 ORIG->B), S2 (09:00 B->C), S3 rev3 (10:00 C->D).
+st, body = call("POST", "/api/waybills/AWB-SMOKE/scans/batch", {"scans": [
+    {"scan_id": "S4", "revision": 2, "event_type": "WITHDRAWAL"},
+    {"scan_id": "S5", "revision": 2, "event_type": "WITHDRAWAL"},
+]})
+check("simultaneous pair withdrawn", st == 200 and body["chain"]["chain_intact"] is True, body)
+st, body = call("PUT", "/api/waybills/AWB-SMOKE/plan", {"revision": 1, "items": [
+    {"receiver": "B", "window_start": "2026-11-18T07:00:00Z",
+     "window_end": "2026-11-18T09:00:00Z", "required": True},
+    {"receiver": "C", "window_start": "2026-11-18T09:00:00Z",
+     "window_end": "2026-11-18T09:30:00Z", "required": True},
+    {"receiver": "D", "window_start": "2026-11-18T09:30:00Z",
+     "window_end": "2026-11-18T10:00:00Z", "required": True},
+]})
+check("plan registered", st == 200 and body["plan_revision"] == 1, body)
+check("plan receipt carries reconciliation",
+      body["reconciliation"]["plan_revision"] == 1, body["reconciliation"])
+
+st, body = call("GET", "/api/waybills/AWB-SMOKE/reconciliation")
+check("reconciliation query", st == 200 and body["plan_revision"] == 1, body)
+check("all required items confirmed",
+      [i["status"] for i in body["items"]] == ["CONFIRMED"] * 3, body["items"])
+check("journey complete", body["complete"] is True, body)
+
+# A trusted scan that fits no plan item -> earliest unmatchable prefix.
+st, body = call("POST", "/api/waybills/AWB-SMOKE/scans/batch", {"scans": [
+    {"scan_id": "S6", "revision": 1, "ts_utc": "2026-11-18T10:20:00Z",
+     "giver": "D", "receiver": "Z"},
+]})
+check("batch receipt carries plan revision", st == 200 and body["plan_revision"] == 1, st)
+check("unmatchable scan located",
+      body["reconciliation"]["unresolved"]["scan_id"] == "S6"
+      and body["reconciliation"]["unresolved"]["revision"] == 1,
+      body["reconciliation"])
+
+# correction makes the prefix matchable again
+st, body = call("POST", "/api/waybills/AWB-SMOKE/scans/batch", {"scans": [
+    {"scan_id": "S6", "revision": 2, "ts_utc": "2026-11-18T10:20:00Z",
+     "giver": "D", "receiver": "Z"},
+]})
+st, body = call("PUT", "/api/waybills/AWB-SMOKE/plan", {"revision": 2, "items": [
+    {"receiver": "B", "window_start": "2026-11-18T07:00:00Z",
+     "window_end": "2026-11-18T09:00:00Z", "required": True},
+    {"receiver": "C", "window_start": "2026-11-18T09:00:00Z",
+     "window_end": "2026-11-18T09:30:00Z", "required": True},
+    {"receiver": "D", "window_start": "2026-11-18T09:30:00Z",
+     "window_end": "2026-11-18T10:00:00Z", "required": True},
+    {"receiver": "Z", "window_start": "2026-11-18T10:00:00Z",
+     "window_end": "2026-11-18T11:00:00Z", "required": True},
+]})
+check("plan replacement reconciled", st == 200 and body["plan_revision"] == 2, st)
+check("replacement receipt confirms every item",
+      [i["status"] for i in body["reconciliation"]["items"]] == ["CONFIRMED"] * 4,
+      body["reconciliation"])
+check("replacement receipt completes journey",
+      body["reconciliation"]["complete"] is True, body["reconciliation"])
+
+st, body = call("PUT", "/api/waybills/AWB-SMOKE/plan", {"revision": 3, "items": [
+    {"receiver": "NOPE", "window_start": "2026-11-18T07:00:00Z",
+     "window_end": "2026-11-18T08:00:00Z", "required": True},
+]})
+check("full plan replacement accepted", st == 200 and body["plan_revision"] == 3, body)
+check("replacement swaps the whole plan",
+      [i["receiver"] for i in body["plan"]["items"]] == ["NOPE"], body["plan"])
+check("remaining scan unmatched after replacement",
+      body["reconciliation"]["unresolved"] is not None, body["reconciliation"])
+st, body = call("GET", "/api/waybills/AWB-SMOKE/plan")
+check("stored plan is the replacement", st == 200 and body["revision"] == 3
+      and len(body["items"]) == 1, body)
+
+print("ALL SMOKE CHECKS PASSED (incl. plan)")

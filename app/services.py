@@ -1,12 +1,16 @@
-"""Domain logic: revision arbitration, atomic batch apply, chain recomputation.
+"""Domain logic: revision arbitration, atomic batch apply, plan reconciliation.
 
 All write paths run inside one ``BEGIN IMMEDIATE`` transaction.  Any rule
 violation raises ``DomainConflict`` / ``DomainValidation`` and rolls the whole
-batch back, so the previously committed chain is preserved untouched.
+batch back, so the previously committed chain and plan are preserved untouched.
+Read paths use a single WAL read snapshot so plan, scans and chain always come
+from the same committed state.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .schemas import (
@@ -14,7 +18,16 @@ from .schemas import (
     BatchSubmit,
     BreakReason,
     ChainResponse,
+    MatchSummary,
+    PlanItemStatus,
+    PlanItemView,
+    PlanReplace,
+    PlanReplaceResponse,
+    PlanView,
+    Reconciliation,
     ScanEntry,
+    ScanResolution,
+    ScanStatus,
     ScanView,
     WaybillCreate,
     entry_payload_hash,
@@ -23,6 +36,24 @@ from .schemas import (
 )
 
 _STORAGE_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+# Plan item windows are stored in the same fixed-width UTC form as scan times.
+_PLAN_TS_FMT = _STORAGE_FMT
+
+
+@dataclass(frozen=True)
+class _PlanItem:
+    index: int  # 0-based position in plan order
+    receiver: str
+    start: datetime
+    end: datetime
+    required: bool
+
+
+@dataclass(frozen=True)
+class _StoredPlan:
+    revision: int
+    items: tuple[_PlanItem, ...]
 
 
 class DomainConflict(Exception):
@@ -85,14 +116,23 @@ def apply_batch(
                 withdrawn.append(entry.scan_id)
             applied += 1
 
-    # Recompute against the freshly committed snapshot.  Scan writes and the
-    # returned query result therefore become visible together.
-    chain = compute_chain(conn, waybill_id)
+        # Computed inside the same write transaction, so the receipt reflects
+        # exactly the state this submission committed -- never a later write
+        # that happens to slip in between COMMIT and the response.
+        chain = _compute_chain_locked(conn, waybill_id)
+        plan = load_plan(conn, waybill_id)
+        reconciliation = _reconcile_locked(conn, waybill_id, chain=chain, plan=plan)
+
+    chain.plan_revision = plan.revision if plan else None
+    chain.reconciliation = reconciliation
+
     return BatchResponse(
         waybill_id=waybill_id,
         applied=applied,
         idempotent_duplicates=idempotent,
         withdrawn_scan_ids=withdrawn,
+        plan_revision=chain.plan_revision,
+        reconciliation=reconciliation,
         chain=chain,
     )
 
@@ -155,6 +195,117 @@ def _apply_one(conn: sqlite3.Connection, waybill_id: str, entry: ScanEntry) -> b
 
 
 # --------------------------------------------------------------------------- #
+# Handover plan registration (full replacement per waybill)
+# --------------------------------------------------------------------------- #
+def _normalize_plan_items(body: PlanReplace) -> list[dict]:
+    items: list[dict] = []
+    for item in body.items:
+        items.append(
+            {
+                "receiver": item.receiver,
+                "window_start": to_utc_iso(item.window_start),
+                "window_end": to_utc_iso(item.window_end),
+                "required": item.required,
+            }
+        )
+    return items
+
+
+def replace_plan(
+    conn: sqlite3.Connection, waybill_id: str, body: PlanReplace
+) -> PlanReplaceResponse:
+    """Register or fully replace the waybill's handover plan atomically.
+
+    Every call swaps the whole item list, so a replacement never merges with
+    the previous plan.  ``revision`` is the version identifier this submission
+    corresponds to; when omitted it becomes current + 1 (1 on first
+    registration).  The response carries that plan revision and the
+    reconciliation of the state this call committed.
+    """
+    from .database import transaction
+
+    get_waybill(conn, waybill_id)
+    items = _normalize_plan_items(body)
+
+    with transaction(conn):
+        current = conn.execute(
+            "SELECT revision FROM custody_plans WHERE waybill_id = ?", (waybill_id,)
+        ).fetchone()
+        adopted = current["revision"] if current is not None else 0
+        revision = body.revision if body.revision is not None else adopted + 1
+        conn.execute(
+            "INSERT INTO custody_plans (waybill_id, revision, items_json, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(waybill_id) DO UPDATE SET "
+            "revision = excluded.revision, items_json = excluded.items_json, "
+            "created_at = excluded.created_at",
+            (waybill_id, revision, json.dumps(items, sort_keys=True), utcnow_iso()),
+        )
+        # Read back inside the same write transaction: the receipt describes
+        # exactly the plan version and scan state this call committed.
+        plan = load_plan(conn, waybill_id)
+        chain = _compute_chain_locked(conn, waybill_id)
+        reconciliation = _reconcile_locked(conn, waybill_id, chain=chain, plan=plan)
+
+    return PlanReplaceResponse(
+        waybill_id=waybill_id,
+        plan_revision=plan.revision if plan else None,
+        plan=_plan_view(waybill_id, plan),
+        reconciliation=reconciliation,
+    )
+
+
+def load_plan(conn: sqlite3.Connection, waybill_id: str) -> "_StoredPlan | None":
+    row = conn.execute(
+        "SELECT revision, items_json FROM custody_plans WHERE waybill_id = ?",
+        (waybill_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = json.loads(row["items_json"])
+    items = tuple(
+        _PlanItem(
+            index=i,
+            receiver=entry["receiver"],
+            start=datetime.strptime(entry["window_start"], _PLAN_TS_FMT).replace(
+                tzinfo=timezone.utc
+            ),
+            end=datetime.strptime(entry["window_end"], _PLAN_TS_FMT).replace(
+                tzinfo=timezone.utc
+            ),
+            required=bool(entry["required"]),
+        )
+        for i, entry in enumerate(raw)
+    )
+    return _StoredPlan(revision=row["revision"], items=items)
+
+
+def _plan_view(waybill_id: str, plan: "_StoredPlan | None") -> PlanView | None:
+    if plan is None:
+        return None
+    return PlanView(
+        waybill_id=waybill_id,
+        revision=plan.revision,
+        items=[
+            PlanItemView(
+                index=item.index,
+                receiver=item.receiver,
+                window_start=item.start,
+                window_end=item.end,
+                required=item.required,
+            )
+            for item in plan.items
+        ],
+    )
+
+
+def get_plan(conn: sqlite3.Connection, waybill_id: str) -> PlanView | None:
+    """Read the currently registered plan (None when the waybill has none)."""
+    get_waybill(conn, waybill_id)
+    return _plan_view(waybill_id, load_plan(conn, waybill_id))
+
+
+# --------------------------------------------------------------------------- #
 # Chain recomputation
 # --------------------------------------------------------------------------- #
 def _adopted_handovers(
@@ -187,6 +338,21 @@ def _parse_ts(text: str) -> datetime:
 
 
 def compute_chain(conn: sqlite3.Connection, waybill_id: str) -> ChainResponse:
+    """Recompute the verified prefix from scans and the registered plan."""
+    from .database import read_transaction
+
+    with read_transaction(conn):
+        chain = _compute_chain_locked(conn, waybill_id)
+        plan = load_plan(conn, waybill_id)
+        reconciliation = _reconcile_locked(conn, waybill_id, chain=chain, plan=plan)
+    chain.plan_revision = plan.revision if plan else None
+    chain.reconciliation = reconciliation
+    return chain
+
+
+def _compute_chain_locked(
+    conn: sqlite3.Connection, waybill_id: str
+) -> ChainResponse:
     waybill = get_waybill(conn, waybill_id)
     origin = waybill["origin_party"]
 
@@ -265,6 +431,257 @@ def compute_chain(conn: sqlite3.Connection, waybill_id: str) -> ChainResponse:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Reconciliation: legal correspondences between the trusted scan prefix and
+# the registered handover plan
+# --------------------------------------------------------------------------- #
+def _compatible(scan: ScanView, item: _PlanItem) -> bool:
+    """Receiver matches and the scan time falls inside the inclusive window."""
+    if scan.receiver != item.receiver:
+        return False
+    assert scan.ts_utc is not None  # HANDOVER scans always carry a timestamp
+    ts = scan.ts_utc
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ts = ts.astimezone(timezone.utc)
+    return item.start <= ts <= item.end
+
+
+def _correspondence_table(
+    scans: list[ScanView], items: tuple[_PlanItem, ...]
+) -> tuple[list[list[int]], int] | None:
+    """Forward DP over (scan index, next plan item index).
+
+    A prefix of ``scans`` corresponds legally to the plan when every scan is
+    assigned a distinct, increasing plan item whose receiver and time window
+    match, while between assigned items (and before the first one) only
+    non-required items may be skipped.  Items left after the last matched item
+    are simply left for later scans, required or not.
+
+    Returns ``(forward, total)`` where ``forward[i][j]`` counts the paths
+    reaching state (first ``i`` scans matched, next item ``j``), and ``total``
+    counts distinct scan -> item assignments (a trailing run of skipped items
+    is not a different correspondence).  ``None`` when no legal
+    correspondence exists.
+    """
+    n = len(scans)
+    m = len(items)
+    if n > m:
+        return None
+
+    compat = [[_compatible(scans[i], items[j]) for j in range(m)] for i in range(n)]
+
+    forward = [[0] * (m + 1) for _ in range(n + 1)]
+    forward[0][0] = 1
+    for i in range(n + 1):
+        for j in range(m + 1):
+            here = forward[i][j]
+            if not here or i == n:
+                continue
+            if j < m:
+                if compat[i][j]:
+                    forward[i + 1][j + 1] += here
+                if not items[j].required:
+                    # skip a non-required item before the first / between scans
+                    forward[i][j + 1] += here
+
+    if n == 0:
+        total = 1  # the empty prefix trivially corresponds to the plan
+    else:
+        # Finalise the moment the last scan is matched, so that differently
+        # long trailing skips do not inflate the count.
+        total = sum(
+            forward[n - 1][j] for j in range(m) if compat[n - 1][j]
+        )
+    if total == 0:
+        return None
+    return forward, total
+
+
+def _suffix_counts(
+    scans: list[ScanView], items: tuple[_PlanItem, ...]
+) -> list[list[int]]:
+    """``suffix[i][j]`` = ways to finish matching all remaining scans from state
+    (first ``i`` scans matched, item ``j`` next)."""
+    n = len(scans)
+    m = len(items)
+    compat = [[_compatible(scans[i], items[j]) for j in range(m)] for i in range(n)]
+    suffix = [[0] * (m + 1) for _ in range(n + 1)]
+    for j in range(m + 1):
+        suffix[n][j] = 1  # every remaining plan item is simply left for later
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            ways = 0
+            if compat[i][j]:
+                ways += suffix[i + 1][j + 1]
+            if not items[j].required:
+                ways += suffix[i][j + 1]
+            suffix[i][j] = ways
+    return suffix
+
+
+def _match_status(
+    scans: list[ScanView],
+    items: tuple[_PlanItem, ...],
+    forward: list[list[int]],
+    total: int,
+) -> tuple[list[PlanItemStatus], list[ScanStatus]]:
+    suffix = _suffix_counts(scans, items)
+    n = len(scans)
+    m = len(items)
+    compat = [[_compatible(scans[i], items[j]) for j in range(m)] for i in range(n)]
+
+    # How many correspondences pass through each (scan i -> item j) edge.
+    edge = [[0] * m for _ in range(n)]
+    for i in range(n):
+        for j in range(m):
+            if compat[i][j] and forward[i][j]:
+                edge[i][j] = forward[i][j] * suffix[i + 1][j + 1]
+
+    item_statuses: list[PlanItemStatus] = []
+    for j, item in enumerate(items):
+        supporting = [scans[i].scan_id for i in range(n) if edge[i][j] > 0]
+        matched = sum(edge[i][j] for i in range(n))
+        if matched == total:
+            status = "CONFIRMED"
+        elif matched > 0:
+            status = "POSSIBLE"
+        else:
+            status = "UNSUPPORTED"
+        item_statuses.append(
+            PlanItemStatus(
+                index=item.index,
+                receiver=item.receiver,
+                required=item.required,
+                status=status,
+                supporting_scan_ids=supporting,
+            )
+        )
+
+    scan_statuses: list[ScanStatus] = []
+    for i, scan in enumerate(scans):
+        possible = [j for j in range(m) if edge[i][j] > 0]
+        status = "CONFIRMED" if len(possible) == 1 else "POSSIBLE"
+        scan_statuses.append(
+            ScanStatus(
+                scan_id=scan.scan_id,
+                revision=scan.revision,
+                status=status,
+                plan_indices=possible,
+            )
+        )
+    return item_statuses, scan_statuses
+
+
+def _reconcile_locked(
+    conn: sqlite3.Connection,
+    waybill_id: str,
+    *,
+    chain: ChainResponse,
+    plan: "_StoredPlan | None",
+) -> Reconciliation:
+    scans = chain.verified_prefix  # trusted prefix, in order
+    base = dict(
+        waybill_id=waybill_id,
+        plan_revision=plan.revision if plan else None,
+        has_plan=plan is not None,
+        scans_considered=len(scans),
+        chain_intact=chain.chain_intact,
+    )
+    if plan is None:
+        return Reconciliation(
+            **base,
+            match=MatchSummary(),
+            items=[],
+            scans=[],
+            unresolved=None,
+            required_covered=False,
+            complete=False,
+        )
+
+    items = plan.items
+    if not scans:
+        return Reconciliation(
+            **base,
+            match=MatchSummary(),
+            items=[
+                PlanItemStatus(
+                    index=item.index,
+                    receiver=item.receiver,
+                    required=item.required,
+                    status="UNSUPPORTED",
+                    supporting_scan_ids=[],
+                )
+                for item in items
+            ],
+            scans=[],
+            unresolved=None,
+            required_covered=False,
+            complete=False,
+        )
+
+    result = _correspondence_table(scans, items)
+
+    if result is None:
+        # Earliest prefix that is no longer matchable.  Matchability is
+        # monotone, so the first failing prefix pinpoints the offending scan.
+        failing_index = 0
+        for k in range(1, len(scans) + 1):
+            if _correspondence_table(scans[:k], items) is None:
+                failing_index = k - 1
+                break
+        scan = scans[failing_index]
+        before = failing_index
+        unresolved = ScanResolution(
+            scan_id=scan.scan_id,
+            revision=scan.revision,
+            prefix_length=failing_index + 1,
+            detail=(
+                f"trusted scan prefix of {failing_index + 1} scan(s) has no legal "
+                f"correspondence to plan revision {plan.revision}; receiver "
+                f"{scan.receiver!r} at {scan.ts_utc.isoformat() if scan.ts_utc else '?'}"
+                f" cannot be placed after {before} earlier scan(s) under the "
+                "skip / window rules"
+            ),
+        )
+        return Reconciliation(
+            **base,
+            match=MatchSummary(),
+            items=[],
+            scans=[],
+            unresolved=unresolved,
+            required_covered=False,
+            complete=False,
+        )
+
+    forward, total = result
+    item_statuses, scan_statuses = _match_status(scans, items, forward, total)
+    required_covered = all(
+        s.status == "CONFIRMED" for s in item_statuses if s.required
+    )
+    return Reconciliation(
+        **base,
+        match=MatchSummary(correspondence_count=total, max_scans=len(scans)),
+        items=item_statuses,
+        scans=scan_statuses,
+        unresolved=None,
+        required_covered=required_covered,
+        complete=chain.chain_intact and required_covered,
+    )
+
+
+def reconcile(
+    conn: sqlite3.Connection, waybill_id: str
+) -> Reconciliation:
+    """Plan + scans + chain read from one committed snapshot."""
+    from .database import read_transaction
+
+    with read_transaction(conn):
+        chain = _compute_chain_locked(conn, waybill_id)
+        plan = load_plan(conn, waybill_id)
+        return _reconcile_locked(conn, waybill_id, chain=chain, plan=plan)
+
+
 # Re-export so other modules can reuse the domain exceptions.
 __all__ = [
     "DomainConflict",
@@ -272,5 +689,8 @@ __all__ = [
     "apply_batch",
     "compute_chain",
     "create_waybill",
+    "get_plan",
     "get_waybill",
+    "reconcile",
+    "replace_plan",
 ]

@@ -46,6 +46,15 @@ CREATE TABLE IF NOT EXISTS scans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_scans_waybill ON scans (waybill_id, scan_id, revision);
+
+-- One current, fully replaced handover plan per waybill.  ``items_json`` holds
+-- the canonical, time-normalized item list in plan order.
+CREATE TABLE IF NOT EXISTS custody_plans (
+    waybill_id      TEXT PRIMARY KEY REFERENCES waybills(id),
+    revision        INTEGER NOT NULL CHECK (revision > 0),
+    items_json      TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -83,6 +92,24 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     committed chain untouched.
     """
     conn.execute("BEGIN IMMEDIATE;")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """One consistent WAL read snapshot.
+
+    Every ``SELECT`` inside the block observes the same committed state, so a
+    plan replacement committing concurrently can never be mixed with scans
+    from another revision.
+    """
+    conn.execute("BEGIN;")
     try:
         yield conn
     except Exception:

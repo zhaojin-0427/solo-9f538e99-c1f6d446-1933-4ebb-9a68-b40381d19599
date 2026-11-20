@@ -11,7 +11,16 @@ from pydantic import ValidationError
 
 from . import config, services
 from .database import connect, init_db
-from .schemas import BatchResponse, BatchSubmit, ChainResponse, WaybillCreate
+from .schemas import (
+    BatchResponse,
+    BatchSubmit,
+    ChainResponse,
+    PlanReplace,
+    PlanReplaceResponse,
+    PlanView,
+    Reconciliation,
+    WaybillCreate,
+)
 
 
 @asynccontextmanager
@@ -104,8 +113,125 @@ def submit_batch(
 def query_chain(
     waybill_id: str, conn: sqlite3.Connection = Depends(get_conn)
 ) -> ChainResponse:
-    """返回可信连续交接前缀、首处断链原因与当前可确认保管方。"""
+    """返回可信连续交接前缀、首处断链原因、当前可确认保管方及计划核对结果。"""
     return services.compute_chain(conn, waybill_id)
+
+
+# --------------------------------------------------------------------------- #
+# Handover plan (registered expectations) and reconciliation queries
+# --------------------------------------------------------------------------- #
+@app.put(
+    "/api/waybills/{waybill_id}/plan",
+    response_model=PlanReplaceResponse,
+    tags=["plan"],
+)
+def put_plan(
+    waybill_id: str,
+    body: PlanReplace,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> PlanReplaceResponse:
+    """按运单登记或整版替换交接计划（最多 60 项）。
+
+    成功回执带上本次提交的计划版号与核对结果；版号须严格递增，
+    过期替换返回 409 且保留原计划。核对结果与本次提交后的扫描状态一致。
+    """
+    return services.replace_plan(conn, waybill_id, body)
+
+
+@app.post(
+    "/api/waybills/{waybill_id}/plan",
+    response_model=PlanReplaceResponse,
+    include_in_schema=False,
+)
+def post_plan(
+    waybill_id: str,
+    body: PlanReplace,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> PlanReplaceResponse:
+    """Alias of PUT /plan for clients that only issue POST."""
+    return services.replace_plan(conn, waybill_id, body)
+
+
+@app.get(
+    "/api/waybills/{waybill_id}/plan",
+    response_model=PlanView,
+    tags=["plan"],
+)
+def get_plan(
+    waybill_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> PlanView:
+    """读取当前生效的交接计划；未登记时 revision 为 null、items 为空。"""
+    plan = services.get_plan(conn, waybill_id)
+    if plan is None:
+        return PlanView(waybill_id=waybill_id, revision=None, items=[])
+    return plan
+
+
+@app.get(
+    "/api/waybills/{waybill_id}/reconciliation",
+    response_model=Reconciliation,
+    tags=["plan"],
+)
+def query_reconciliation(
+    waybill_id: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> Reconciliation:
+    """计划与可信扫描前缀的核对结果（同一已提交快照）。"""
+    return services.reconcile(conn, waybill_id)
+
+
+# Common path aliases so clients may register/query a plan under any of the
+# intuitive resource names.  They share the same semantics and schema.
+_PLAN_ALIASES = ("handover-plan", "handover_plan", "plans")
+
+
+@app.put(
+    "/api/waybills/{waybill_id}/{plan_resource}",
+    response_model=PlanReplaceResponse,
+    include_in_schema=False,
+)
+def put_plan_alias(
+    waybill_id: str,
+    plan_resource: str,
+    body: PlanReplace,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> PlanReplaceResponse:
+    if plan_resource not in _PLAN_ALIASES:
+        raise services.DomainValidation(f"unknown resource {plan_resource!r}")
+    return services.replace_plan(conn, waybill_id, body)
+
+
+@app.post(
+    "/api/waybills/{waybill_id}/{plan_resource}",
+    response_model=PlanReplaceResponse,
+    include_in_schema=False,
+)
+def post_plan_alias(
+    waybill_id: str,
+    plan_resource: str,
+    body: PlanReplace,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> PlanReplaceResponse:
+    if plan_resource not in _PLAN_ALIASES:
+        raise services.DomainValidation(f"unknown resource {plan_resource!r}")
+    return services.replace_plan(conn, waybill_id, body)
+
+
+@app.get(
+    "/api/waybills/{waybill_id}/{plan_resource}",
+    response_model=PlanView,
+    include_in_schema=False,
+)
+def get_plan_alias(
+    waybill_id: str,
+    plan_resource: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> PlanView:
+    if plan_resource not in _PLAN_ALIASES:
+        raise services.DomainValidation(f"unknown resource {plan_resource!r}")
+    plan = services.get_plan(conn, waybill_id)
+    if plan is None:
+        return PlanView(waybill_id=waybill_id, revision=None, items=[])
+    return plan
 
 
 # --------------------------------------------------------------------------- #

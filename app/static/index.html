@@ -32,8 +32,13 @@
   th { background: #f6f8fa; }
   .ok { color: var(--ok); font-weight: 600; }
   .bad { color: var(--bad); font-weight: 600; }
+  .warn { color: #9a6700; font-weight: 600; }
+  .muted { color: var(--muted); font-weight: 600; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; }
-  .pill.ok { background: #dafbe1; } .pill.bad { background: #ffebe9; }
+  .pill.ok { background: #dafbe1; color: var(--ok); }
+  .pill.bad { background: #ffebe9; color: var(--bad); }
+  .pill.warn { background: #fff8c5; color: #9a6700; }
+  .pill.muted { background: #eaeef2; color: var(--muted); }
   .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
   #status { font-size: 12px; margin-top: 8px; min-height: 16px; }
 </style>
@@ -66,12 +71,31 @@
   </div>
 
   <div class="card">
-    <h2>3. 查询保管链</h2>
+    <h2>3. 登记 / 整版替换交接计划</h2>
+    <label>运单号</label><input id="plan-wb" value="AWB-001" />
+    <label>计划 JSON（版号须高于已存版本，最多 60 项）</label>
+    <textarea id="plan-json">{
+  "revision": 1,
+  "items": [
+    {"receiver": "CX-CARGO", "window_start": "2026-11-18T07:00:00Z",
+     "window_end": "2026-11-18T09:00:00Z", "required": true},
+    {"receiver": "PVG-WAREHOUSE", "window_start": "2026-11-18T09:00:00Z",
+     "window_end": "2026-11-18T11:00:00Z", "required": false}
+  ]
+}</textarea>
+    <div class="hint">时间窗含首尾，必须带时区。提交成功回执含计划版号与核对结果。</div>
+    <button onclick="replacePlan()">登记计划</button>
+  </div>
+
+  <div class="card">
+    <h2>4. 查询保管链与核对</h2>
     <label>运单号</label>
     <div class="row"><input id="query-wb" value="AWB-001" />
       <button onclick="queryChain()" style="margin-top:0">查询</button></div>
     <div id="chain-summary" style="margin-top:10px"></div>
+    <div id="recon-summary"></div>
     <div id="chain-table"></div>
+    <div id="recon-table"></div>
   </div>
 
   <div class="card">
@@ -107,9 +131,17 @@ async function submitBatch() {
   try {
     const body = JSON.parse($('batch-json').value);
     const data = await call(`/api/waybills/${encodeURIComponent($('batch-wb').value.trim())}/scans/batch`, 'POST', body);
-    setStatus(`批次已提交：写入 ${data.applied} 笔，幂等 ${data.idempotent_duplicates} 笔`);
+    setStatus(`批次已提交：写入 ${data.applied} 笔，幂等 ${data.idempotent_duplicates} 笔，计划版号 ${data.plan_revision ?? '未登记'}`);
     renderChain(data.chain);
   } catch (e) { setStatus('整批拒绝（旧链保留）：' + e.message, true); }
+}
+async function replacePlan() {
+  try {
+    const body = JSON.parse($('plan-json').value);
+    const data = await call(`/api/waybills/${encodeURIComponent($('plan-wb').value.trim())}/plan`, 'PUT', body);
+    setStatus(`计划已登记：版号 ${data.plan_revision}`);
+    renderReconciliation(data.reconciliation);
+  } catch (e) { setStatus('计划被拒绝（原计划保留）：' + e.message, true); }
 }
 async function queryChain() {
   try {
@@ -118,12 +150,42 @@ async function queryChain() {
   } catch (e) { setStatus('查询失败：' + e.message, true); }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+const STATUS_LABEL = {CONFIRMED: '确定经过', POSSIBLE: '可能经过', UNSUPPORTED: '尚无可信依据'};
+const STATUS_CLASS = {CONFIRMED: 'ok', POSSIBLE: 'warn', UNSUPPORTED: 'muted'};
+function renderReconciliation(r) {
+  if (!r) { $('recon-summary').innerHTML = ''; $('recon-table').innerHTML = ''; return; }
+  if (!r.has_plan) {
+    $('recon-summary').innerHTML = '<p class="hint">该运单尚未登记交接计划。</p>';
+    $('recon-table').innerHTML = ''; return;
+  }
+  let head = `计划版号 <b>${r.plan_revision}</b>，参与核对的可信扫描 ${r.scans_considered} 笔，` +
+    `合法对应 ${r.match.correspondence_count} 种；` +
+    `必经项覆盖：<span class="pill ${r.required_covered ? 'ok' : 'bad'}">${r.required_covered ? '全部覆盖' : '未全部覆盖'}</span> ` +
+    `走完：<span class="pill ${r.complete ? 'ok' : 'bad'}">${r.complete ? '是' : '否'}</span>`;
+  if (r.unresolved) {
+    head += `<br/><span class="bad">无合法对应</span>：最早无法对应的扫描 <b>${esc(r.unresolved.scan_id)}</b>` +
+      `（修订 ${r.unresolved.revision}，前缀 ${r.unresolved.prefix_length} 笔）— ${esc(r.unresolved.detail)}`;
+  }
+  $('recon-summary').innerHTML = head;
+  if (!r.items.length && !r.scans.length) { $('recon-table').innerHTML = ''; return; }
+  $('recon-table').innerHTML =
+    '<table><tr><th>计划项</th><th>接收方</th><th>必经</th><th>状态</th><th>对应扫描</th></tr>' +
+    r.items.map(i => `<tr><td>${i.index + 1}</td><td>${esc(i.receiver)}</td>` +
+      `<td>${i.required ? '是' : '否'}</td>` +
+      `<td><span class="pill ${STATUS_CLASS[i.status]}">${STATUS_LABEL[i.status]}</span></td>` +
+      `<td>${esc((i.supporting_scan_ids || []).join(', '))}</td></tr>`).join('') +
+    '</table><table><tr><th>扫描</th><th>修订</th><th>状态</th><th>可能对应的计划项</th></tr>' +
+    r.scans.map(s => `<tr><td>${esc(s.scan_id)}</td><td>${s.revision}</td>` +
+      `<td><span class="pill ${STATUS_CLASS[s.status]}">${STATUS_LABEL[s.status]}</span></td>` +
+      `<td>${s.plan_indices.map(i => i + 1).join(', ')}</td></tr>`).join('') + '</table>';
+}
 function renderChain(c) {
   const intact = c.chain_intact;
   $('chain-summary').innerHTML =
     `当前可确认保管方：<b>${esc(c.current_custodian)}</b><br/>` +
     `链状态：<span class="pill ${intact ? 'ok' : 'bad'}">${intact ? '完整可信' : '存在断链'}</span> ` +
     (intact ? '' : `原因 <b>${esc(c.break_reason)}</b> — ${esc(c.break_detail)}`);
+  renderReconciliation(c.reconciliation);
   const rows = [...c.verified_prefix.map(v => ({...v, _v: true})),
                 ...c.unverified_scans.map(v => ({...v, _v: false}))];
   if (!rows.length) { $('chain-table').innerHTML = '<p class="hint">暂无已采纳的交接扫描。</p>'; return; }
